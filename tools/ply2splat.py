@@ -31,7 +31,7 @@ op = 1.0 / (1.0 + np.exp(-np.asarray(v["opacity"], dtype=np.float32)))
 dc = f("f_dc_0", "f_dc_1", "f_dc_2")
 q = f("rot_0", "rot_1", "rot_2", "rot_3")  # w,x,y,z
 
-ok = np.isfinite(xyz).all(1) & np.isfinite(sc).all(1) & np.isfinite(q).all(1) & np.isfinite(op)
+ok = np.isfinite(xyz).all(1) & np.isfinite(sc).all(1) & np.isfinite(q).all(1) & np.isfinite(op) & (op > 0.02)
 idx = np.nonzero(ok)[0]
 
 # angular-size importance: opacity * cbrt(volume) / depth

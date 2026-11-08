@@ -138,9 +138,9 @@ for(let i=0;i<n;i++)out[cnt[bins[i]]++]=i;
 postMessage(out,[out.buffer])}`;
 const worker = new Worker(URL.createObjectURL(new Blob([wsrc], {type:'application/javascript'})));
 worker.postMessage({pos}, [pos.buffer]);
-let sorting = false, dirty = true;
+let sorting = false, dirty = true, first = true, lastN = [9, 9, 9];
 worker.onmessage = e => {
-  gl.bindBuffer(gl.ARRAY_BUFFER, ib); gl.bufferData(gl.ARRAY_BUFFER, e.data, gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, ib); gl.bufferSubData(gl.ARRAY_BUFFER, 0, e.data);
   sorting = false;
 };
 
@@ -149,11 +149,23 @@ const zc = meta.zc || 2;
 let yaw = 0, pitch = 0, tyaw = 0, tpitch = 0, zoom = 1, tzoom = 1, lastTouch = -1e9;
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const ptrs = new Map(); let pinch0 = 0;
+let gyroOn = false, g0 = null, b0 = null;
+const GAIN = 1.5, SX = 1, SY = 1;           // flip SX/SY to -1 if parallax goes the wrong way
+const wrap = a => { while (a > 180) a -= 360; while (a < -180) a += 360; return a; };
+window.addEventListener('deviceorientation', e => {
+  if (e.gamma == null || e.beta == null) return;
+  gyroOn = true;
+  if (g0 === null) { g0 = e.gamma; b0 = e.beta; }
+  const dg = wrap(e.gamma - g0), db = wrap(e.beta - b0);
+  g0 += dg * 0.003; b0 += db * 0.003;        // slow re-center if phone is held tilted
+  tyaw = clamp(SX * dg * Math.PI / 180 * GAIN, -0.6, 0.6);
+  tpitch = clamp(SY * db * Math.PI / 180 * GAIN, -0.4, 0.4);
+});
 cv.addEventListener('pointerdown', e => { cv.setPointerCapture(e.pointerId); ptrs.set(e.pointerId, [e.clientX, e.clientY]);
   if (ptrs.size === 2) { const [a, b] = [...ptrs.values()]; pinch0 = Math.hypot(a[0]-b[0], a[1]-b[1]); } lastTouch = performance.now(); });
 cv.addEventListener('pointermove', e => {
   const p = ptrs.get(e.pointerId); if (!p) return;
-  if (ptrs.size === 1) {
+  if (ptrs.size === 1 && !gyroOn) {
     tyaw = clamp(tyaw - (e.clientX - p[0]) * 0.004, -0.6, 0.6);
     tpitch = clamp(tpitch + (e.clientY - p[1]) * 0.004, -0.4, 0.4);
   }
@@ -164,10 +176,10 @@ cv.addEventListener('pointermove', e => {
 });
 const up = e => { ptrs.delete(e.pointerId); pinch0 = 0; lastTouch = performance.now(); };
 cv.addEventListener('pointerup', up); cv.addEventListener('pointercancel', up);
-cv.addEventListener('dblclick', () => { tyaw = tpitch = 0; tzoom = 1; });
+cv.addEventListener('dblclick', () => { tyaw = tpitch = 0; tzoom = 1; g0 = null; });
 
 function resize() {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const dpr = 1;
   cv.width = Math.round(cv.clientWidth * dpr); cv.height = Math.round(cv.clientHeight * dpr);
   gl.viewport(0, 0, cv.width, cv.height); dirty = true;
 }
@@ -175,7 +187,7 @@ window.addEventListener('resize', resize); resize();
 
 msg.style.display = 'none';
 function frame(now) {
-  if (now - lastTouch > 3000 && ptrs.size === 0) { tyaw = 0.12 * Math.sin(now / 1800); tpitch = 0.05 * Math.sin(now / 2500); }
+  if (!gyroOn && now - lastTouch > 3000 && ptrs.size === 0) { tyaw = 0.12 * Math.sin(now / 1800); tpitch = 0.05 * Math.sin(now / 2500); }
   const ny = yaw + (tyaw - yaw) * 0.12, np = pitch + (tpitch - pitch) * 0.12, nz = zoom + (tzoom - zoom) * 0.12;
   if (Math.abs(ny-yaw) + Math.abs(np-pitch) + Math.abs(nz-zoom) > 1e-5) dirty = true;
   yaw = ny; pitch = np; zoom = nz;
@@ -198,7 +210,8 @@ function frame(now) {
   const proj = new Float32Array([
     2*fx/W, 0, 0, 0,  0, -2*fy/H, 0, 0,  0, 0, zf/(zf-zn), 1,  0, 0, -zf*zn/(zf-zn), 0]);
 
-  if (dirty && !sorting) { sorting = true; dirty = false;
+  const dn = Math.abs(view[2]-lastN[0]) + Math.abs(view[6]-lastN[1]) + Math.abs(view[10]-lastN[2]);
+  if (!sorting && (first || dn > 0.004)) { sorting = true; first = false; lastN = [view[2], view[6], view[10]];
     worker.postMessage({v: [view[2], view[6], view[10], view[14]]}); }
 
   gl.uniformMatrix4fv(U('uProj'), false, proj); gl.uniformMatrix4fv(U('uView'), false, view);
