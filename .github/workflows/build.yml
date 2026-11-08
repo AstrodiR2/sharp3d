@@ -1,0 +1,77 @@
+name: sharp-3d-preview
+
+on:
+  push:
+    paths: ['input/**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: pick image
+        id: img
+        run: |
+          IMG=$(git log -1 --diff-filter=AM --name-only --pretty=format: -- input | grep -iE '\.(jpe?g|png)$' | head -1 || true)
+          [ -z "$IMG" ] && IMG=$(ls input/*.jpg input/*.jpeg input/*.png input/*.JPG input/*.PNG 2>/dev/null | head -1 || true)
+          [ -z "$IMG" ] && { echo "no jpg/png in input/"; exit 1; }
+          echo "using $IMG"
+          echo "path=$IMG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: install sharp
+        run: |
+          git clone --depth 1 https://github.com/apple/ml-sharp.git ml-sharp
+          cd ml-sharp
+          pip install -r requirements.txt
+          sharp --help
+
+      - name: cache checkpoint
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/torch/hub/checkpoints
+          key: sharp-ckpt-2572gikvuh
+
+      - name: predict
+        run: sharp predict -i "${{ steps.img.outputs.path }}" -o build/ply --device cpu
+
+      - name: ply -> splat
+        run: python tools/ply2splat.py build/ply app/src/main/assets --max 600000
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: build apk
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: collect
+        run: cp app/build/outputs/apk/debug/app-debug.apk sharp-preview.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sharp-preview-apk
+          path: sharp-preview.apk
+
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete preview --cleanup-tag -y || true
+          gh release create preview sharp-preview.apk --title "3D preview" --notes "src: ${{ steps.img.outputs.path }}"

@@ -1,0 +1,6 @@
+build/
+.gradle/
+app/build/
+local.properties
+app/src/main/assets/scene.splat
+app/src/main/assets/meta.json

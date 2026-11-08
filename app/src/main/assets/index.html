@@ -1,0 +1,213 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none}
+canvas{width:100%;height:100%;display:block}
+#msg{position:fixed;left:0;right:0;top:50%;text-align:center;color:#aaa;font:14px sans-serif}
+</style></head>
+<body><canvas id="c"></canvas><div id="msg">loading...</div>
+<script>
+(async () => {
+const msg = document.getElementById('msg'), cv = document.getElementById('c');
+try {
+const gl = cv.getContext('webgl2', {antialias:false, alpha:true, premultipliedAlpha:true});
+if (!gl) { msg.textContent = 'no webgl2'; return; }
+
+const VS = `#version 300 es
+precision highp float; precision highp int;
+uniform highp usampler2D uTex;
+uniform mat4 uProj, uView;
+uniform vec2 uFocal, uViewport;
+layout(location=0) in vec2 aPos;
+layout(location=1) in uint aIdx;
+out vec4 vColor; out vec2 vPos;
+void main(){
+  int row = int(aIdx >> 9u); int col = int(aIdx & 511u) * 3;
+  uvec4 a = texelFetch(uTex, ivec2(col, row), 0);
+  uvec4 b = texelFetch(uTex, ivec2(col+1, row), 0);
+  uvec4 c = texelFetch(uTex, ivec2(col+2, row), 0);
+  vec3 center = uintBitsToFloat(a.xyz);
+  vec4 cam = uView * vec4(center, 1.0);
+  vec4 p2 = uProj * cam;
+  float clip = 1.2 * p2.w;
+  if (cam.z < 0.05 || p2.x < -clip || p2.x > clip || p2.y < -clip || p2.y > clip) { gl_Position = vec4(0.,0.,2.,1.); return; }
+  vec4 s0 = uintBitsToFloat(b); vec2 s1 = uintBitsToFloat(c.xy);
+  mat3 Vrk = mat3(s0.x,s0.y,s0.z, s0.y,s0.w,s1.x, s0.z,s1.x,s1.y);
+  mat3 J = mat3(
+    uFocal.x/cam.z, 0., -(uFocal.x*cam.x)/(cam.z*cam.z),
+    0., -uFocal.y/cam.z, (uFocal.y*cam.y)/(cam.z*cam.z),
+    0., 0., 0.);
+  mat3 T = transpose(mat3(uView)) * J;
+  mat3 cov2d = transpose(T) * Vrk * T;
+  cov2d[0][0] += 1.2; cov2d[1][1] += 1.2;
+  float mid = (cov2d[0][0] + cov2d[1][1]) * 0.5;
+  float rad = length(vec2((cov2d[0][0]-cov2d[1][1])*0.5, cov2d[0][1]));
+  float l1 = mid + rad, l2 = mid - rad;
+  if (l2 < 0.0) { gl_Position = vec4(0.,0.,2.,1.); return; }
+  vec2 dv = normalize(vec2(cov2d[0][1], l1 - cov2d[0][0]));
+  vec2 major = min(sqrt(2.0*l1), 1024.0) * dv;
+  vec2 minor = min(sqrt(2.0*l2), 1024.0) * vec2(dv.y, -dv.x);
+  uint col4 = a.w;
+  vColor = vec4(float(col4 & 255u), float((col4>>8u)&255u), float((col4>>16u)&255u), float(col4>>24u)) / 255.0;
+  vPos = aPos;
+  vec2 vc = p2.xy / p2.w;
+  gl_Position = vec4(vc + aPos.x*major/uViewport + aPos.y*minor/uViewport, 0.0, 1.0);
+}`;
+const FS = `#version 300 es
+precision highp float;
+in vec4 vColor; in vec2 vPos;
+out vec4 o;
+void main(){
+  float A = -dot(vPos, vPos);
+  if (A < -4.0) discard;
+  float B = exp(A) * vColor.a;
+  o = vec4(B * vColor.rgb, B);
+}`;
+const sh = (t, s) => { const o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o);
+  if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(o)); return o; };
+const pr = gl.createProgram();
+gl.attachShader(pr, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(pr);
+if (!gl.getProgramParameter(pr, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(pr));
+gl.useProgram(pr);
+const U = n => gl.getUniformLocation(pr, n);
+
+const [meta, buf] = await Promise.all([
+  fetch('meta.json').then(r => r.json()),
+  fetch('scene.splat').then(r => r.arrayBuffer())]);
+const N = (buf.byteLength / 32) | 0;
+const f32 = new Float32Array(buf), u8 = new Uint8Array(buf);
+const TW = 512 * 3, TH = Math.ceil(N / 512);
+if (TH > gl.getParameter(gl.MAX_TEXTURE_SIZE)) throw new Error('too many splats for this GPU');
+const tex = new Uint32Array(TW * TH * 4), texf = new Float32Array(tex.buffer);
+const pos = new Float32Array(N * 3);
+for (let i = 0; i < N; i++) {
+  const b = i * 8, ub = i * 32;
+  const x = f32[b], y = f32[b+1], z = f32[b+2];
+  pos[i*3] = x; pos[i*3+1] = y; pos[i*3+2] = z;
+  const s = [f32[b+3], f32[b+4], f32[b+5]];
+  let qw = (u8[ub+28]-128)/128, qx = (u8[ub+29]-128)/128, qy = (u8[ub+30]-128)/128, qz = (u8[ub+31]-128)/128;
+  const ql = Math.hypot(qw,qx,qy,qz) || 1; qw/=ql; qx/=ql; qy/=ql; qz/=ql;
+  const M = [
+    1-2*(qy*qy+qz*qz), 2*(qx*qy+qw*qz), 2*(qx*qz-qw*qy),
+    2*(qx*qy-qw*qz), 1-2*(qx*qx+qz*qz), 2*(qy*qz+qw*qx),
+    2*(qx*qz+qw*qy), 2*(qy*qz-qw*qx), 1-2*(qx*qx+qy*qy)
+  ].map((k, j) => k * s[(j/3)|0]);
+  const base = ((i >> 9) * TW + (i & 511) * 3) * 4;
+  texf[base] = x; texf[base+1] = y; texf[base+2] = z;
+  tex[base+3] = (u8[ub+24] | (u8[ub+25]<<8) | (u8[ub+26]<<16) | (u8[ub+27]<<24)) >>> 0;
+  texf[base+4] = 4*(M[0]*M[0]+M[3]*M[3]+M[6]*M[6]);
+  texf[base+5] = 4*(M[0]*M[1]+M[3]*M[4]+M[6]*M[7]);
+  texf[base+6] = 4*(M[0]*M[2]+M[3]*M[5]+M[6]*M[8]);
+  texf[base+7] = 4*(M[1]*M[1]+M[4]*M[4]+M[7]*M[7]);
+  texf[base+8] = 4*(M[1]*M[2]+M[4]*M[5]+M[7]*M[8]);
+  texf[base+9] = 4*(M[2]*M[2]+M[5]*M[5]+M[8]*M[8]);
+}
+const t = gl.createTexture();
+gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, t);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32UI, TW, TH, 0, gl.RGBA_INTEGER, gl.UNSIGNED_INT, tex);
+gl.uniform1i(U('uTex'), 0);
+
+const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+const qb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, qb);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-2,-2, 2,-2, 2,2, -2,2]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+const ib = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, ib);
+const iota = new Uint32Array(N); for (let i = 0; i < N; i++) iota[i] = i;
+gl.bufferData(gl.ARRAY_BUFFER, iota, gl.DYNAMIC_DRAW);
+gl.enableVertexAttribArray(1); gl.vertexAttribIPointer(1, 1, gl.UNSIGNED_INT, 0, 0); gl.vertexAttribDivisor(1, 1);
+gl.disable(gl.DEPTH_TEST); gl.enable(gl.BLEND);
+gl.blendFuncSeparate(gl.ONE_MINUS_DST_ALPHA, gl.ONE, gl.ONE_MINUS_DST_ALPHA, gl.ONE);
+
+// worker: counting sort by view depth, nearest first (front-to-back "under" blending)
+const wsrc = `let P=null,n=0,D=null;
+onmessage=e=>{const d=e.data;
+if(d.pos){P=d.pos;n=P.length/3;D=new Float32Array(n);return}
+const v=d.v;let mn=1e30,mx=-1e30;
+for(let i=0,j=0;i<n;i++,j+=3){const z=v[0]*P[j]+v[1]*P[j+1]+v[2]*P[j+2]+v[3];D[i]=z;if(z<mn)mn=z;if(z>mx)mx=z}
+const B=65536,cnt=new Uint32Array(B+1),bins=new Uint32Array(n),k=(B-1)/Math.max(mx-mn,1e-6);
+for(let i=0;i<n;i++){const b=((D[i]-mn)*k)|0;bins[i]=b;cnt[b+1]++}
+for(let b=0;b<B;b++)cnt[b+1]+=cnt[b];
+const out=new Uint32Array(n);
+for(let i=0;i<n;i++)out[cnt[bins[i]]++]=i;
+postMessage(out,[out.buffer])}`;
+const worker = new Worker(URL.createObjectURL(new Blob([wsrc], {type:'application/javascript'})));
+worker.postMessage({pos}, [pos.buffer]);
+let sorting = false, dirty = true;
+worker.onmessage = e => {
+  gl.bindBuffer(gl.ARRAY_BUFFER, ib); gl.bufferData(gl.ARRAY_BUFFER, e.data, gl.DYNAMIC_DRAW);
+  sorting = false;
+};
+
+// camera (OpenCV convention: x right, y down, z forward)
+const zc = meta.zc || 2;
+let yaw = 0, pitch = 0, tyaw = 0, tpitch = 0, zoom = 1, tzoom = 1, lastTouch = -1e9;
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const ptrs = new Map(); let pinch0 = 0;
+cv.addEventListener('pointerdown', e => { cv.setPointerCapture(e.pointerId); ptrs.set(e.pointerId, [e.clientX, e.clientY]);
+  if (ptrs.size === 2) { const [a, b] = [...ptrs.values()]; pinch0 = Math.hypot(a[0]-b[0], a[1]-b[1]); } lastTouch = performance.now(); });
+cv.addEventListener('pointermove', e => {
+  const p = ptrs.get(e.pointerId); if (!p) return;
+  if (ptrs.size === 1) {
+    tyaw = clamp(tyaw - (e.clientX - p[0]) * 0.004, -0.6, 0.6);
+    tpitch = clamp(tpitch + (e.clientY - p[1]) * 0.004, -0.4, 0.4);
+  }
+  p[0] = e.clientX; p[1] = e.clientY;
+  if (ptrs.size === 2) { const [a, b] = [...ptrs.values()]; const d = Math.hypot(a[0]-b[0], a[1]-b[1]);
+    if (pinch0 > 0) tzoom = clamp(tzoom * pinch0 / d, 0.5, 1.2); pinch0 = d; }
+  lastTouch = performance.now();
+});
+const up = e => { ptrs.delete(e.pointerId); pinch0 = 0; lastTouch = performance.now(); };
+cv.addEventListener('pointerup', up); cv.addEventListener('pointercancel', up);
+cv.addEventListener('dblclick', () => { tyaw = tpitch = 0; tzoom = 1; });
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width = Math.round(cv.clientWidth * dpr); cv.height = Math.round(cv.clientHeight * dpr);
+  gl.viewport(0, 0, cv.width, cv.height); dirty = true;
+}
+window.addEventListener('resize', resize); resize();
+
+msg.style.display = 'none';
+function frame(now) {
+  if (now - lastTouch > 3000 && ptrs.size === 0) { tyaw = 0.12 * Math.sin(now / 1800); tpitch = 0.05 * Math.sin(now / 2500); }
+  const ny = yaw + (tyaw - yaw) * 0.12, np = pitch + (tpitch - pitch) * 0.12, nz = zoom + (tzoom - zoom) * 0.12;
+  if (Math.abs(ny-yaw) + Math.abs(np-pitch) + Math.abs(nz-zoom) > 1e-5) dirty = true;
+  yaw = ny; pitch = np; zoom = nz;
+
+  const dist = zc * zoom;
+  const dir = [Math.sin(yaw) * Math.cos(pitch), -Math.sin(pitch), -Math.cos(yaw) * Math.cos(pitch)]; // target -> camera
+  const Tg = [0, 0, zc], C = [Tg[0] + dist*dir[0], Tg[1] + dist*dir[1], Tg[2] + dist*dir[2]];
+  const f = [-dir[0], -dir[1], -dir[2]], up = [0, -1, 0];
+  let r = [f[1]*up[2]-f[2]*up[1], f[2]*up[0]-f[0]*up[2], f[0]*up[1]-f[1]*up[0]];
+  const rl = Math.hypot(...r); r = r.map(v => v / rl);
+  const d = [f[1]*r[2]-f[2]*r[1], f[2]*r[0]-f[0]*r[2], f[0]*r[1]-f[1]*r[0]];
+  const dot = (a, b) => a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+  const view = new Float32Array([
+    r[0], d[0], f[0], 0,  r[1], d[1], f[1], 0,  r[2], d[2], f[2], 0,
+    -dot(r, C), -dot(d, C), -dot(f, C), 1]);
+
+  const W = cv.width, H = cv.height;
+  const sc = Math.min(W / meta.width, H / meta.height), fx = meta.f_px * sc, fy = fx;
+  const zn = 0.05, zf = 500;
+  const proj = new Float32Array([
+    2*fx/W, 0, 0, 0,  0, -2*fy/H, 0, 0,  0, 0, zf/(zf-zn), 1,  0, 0, -zf*zn/(zf-zn), 0]);
+
+  if (dirty && !sorting) { sorting = true; dirty = false;
+    worker.postMessage({v: [view[2], view[6], view[10], view[14]]}); }
+
+  gl.uniformMatrix4fv(U('uProj'), false, proj); gl.uniformMatrix4fv(U('uView'), false, view);
+  gl.uniform2f(U('uFocal'), fx, fy); gl.uniform2f(U('uViewport'), W, H);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, N);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+} catch (err) { msg.style.display = 'block'; msg.textContent = 'err: ' + err.message; }
+})();
+</script></body></html>
